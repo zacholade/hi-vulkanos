@@ -88,12 +88,18 @@ fn main() {
 
     // let data: i32 = 12;
 
+    // Any struct deriving from AnyBitPattern from bytemuck library
+    // can be put in a buffer. Vulkano provides its own BufferContents macro
+    // that does this.
     #[derive(BufferContents)]
+    // Any data sent through an FFI boundary should use repr(C).
+    // Makes order, size and allignment of values match that of C/C++.
     #[repr(C)]
     struct MyBufferStruct {
         a: u32,
         b: u32,
     }
+
     let data = MyBufferStruct{a: 1, b: 2};
     let buffer = Buffer::from_data(
         memory_allocator.clone(),
@@ -103,6 +109,9 @@ fn main() {
         },
         AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                // We are using Buffer::from_data to upload data to the buffer so require
+                // that the host can accesss the buffer to upload it. Else we will need
+                // to use a proxy buffer that the data is copied from.
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
