@@ -2,11 +2,18 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
+use vulkano::command_buffer::allocator::{
+    StandardCommandBufferAlloc, StandardCommandBufferAllocator,
+    StandardCommandBufferAllocatorCreateInfo,
+};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::VulkanLibrary;
+use vulkano::sync::{self, GpuFuture};
 
 fn main() {
     let library = VulkanLibrary::new().expect("no local Vulkan library/DLL found");
@@ -86,25 +93,39 @@ fn main() {
 
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-    // let data: i32 = 12;
 
     // Any struct deriving from AnyBitPattern from bytemuck library
     // can be put in a buffer. Vulkano provides its own BufferContents macro
     // that does this.
-    #[derive(BufferContents)]
+    #[derive(BufferContents, Vertex, Debug)]
     // Any data sent through an FFI boundary should use repr(C).
     // Makes order, size and allignment of values match that of C/C++.
     #[repr(C)]
-    struct MyBufferStruct {
-        a: u32,
-        b: u32,
+    struct Vertex {
+        #[format(R32G32_SFLOAT)]
+        position: [f32; 2],
     }
 
-    let data = MyBufferStruct{a: 1, b: 2};
-    let buffer = Buffer::from_data(
+    let vertices = [
+        Vertex {
+            position: [-0.5, -0.25],
+        },
+        Vertex {
+            position: [0.0, 0.5],
+        },
+        Vertex {
+            position: [0.25, -0.1],
+        },
+    ];
+    let destination_vertices: [Vertex; 3] = [
+        Vertex { position: [0.0, 0.0] },
+        Vertex { position: [0.0, 0.0] },
+        Vertex { position: [0.0, 0.0] },
+    ];
+    let vertex_buffer_source = Buffer::from_iter(
         memory_allocator.clone(),
         BufferCreateInfo {
-            usage: BufferUsage::UNIFORM_BUFFER,
+            usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
         AllocationCreateInfo {
@@ -115,7 +136,57 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        data,
+        vertices,
     )
     .expect("Failed to create buffer!");
+
+    let vertex_buffer_destination = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                // We are using Buffer::from_data to upload data to the buffer so require
+                // that the host can accesss the buffer to upload it. Else we will need
+                // to use a proxy buffer that the data is copied from.
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        destination_vertices,
+    )
+    .expect("Failed to create buffer!");
+
+    let command_buffer_allocator = StandardCommandBufferAllocator::new(
+        device.clone(),
+        StandardCommandBufferAllocatorCreateInfo::default(),
+    );
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        &command_buffer_allocator,
+        queue_family_index,
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .unwrap();
+
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(
+            vertex_buffer_source.clone(),
+            vertex_buffer_destination.clone(),
+        ))
+        .unwrap();
+
+    let command_buffer = builder.build().unwrap();
+
+    sync::now(device.clone())
+        .then_execute(queue.clone(), command_buffer)
+        .unwrap()
+        .flush()
+        .unwrap();
+
+    let src_result = vertex_buffer_source.read().unwrap();
+    println!("{:?}", src_result.iter());
+    let dst_result = vertex_buffer_destination.read().unwrap();
+    println!("{:?}", dst_result.iter());
 }
