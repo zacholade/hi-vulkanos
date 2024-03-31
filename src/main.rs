@@ -1,34 +1,44 @@
-use std::ops::Deref;
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::{
-    StandardCommandBufferAlloc, StandardCommandBufferAllocator,
-    StandardCommandBufferAllocatorCreateInfo,
+    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags};
+use vulkano::image::ImageUsage;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::vertex_input::Vertex;
-use vulkano::VulkanLibrary;
+use vulkano::swapchain::{Surface, Swapchain, SwapchainCreateInfo};
 use vulkano::sync::{self, GpuFuture};
+use vulkano::{swapchain, VulkanLibrary};
+use winit::event_loop::EventLoop;
+use winit::window::WindowBuilder;
 
 fn main() {
+    let event_loop = EventLoop::new();
+
     let library = VulkanLibrary::new().expect("no local Vulkan library/DLL found");
+
+    let required_extensions = Surface::required_extensions(&event_loop);
+
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            enabled_extensions: required_extensions,
             ..InstanceCreateInfo::default()
         },
     )
     .expect("Failed to create an instance");
 
+    let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
+    let surface = Surface::from_window(instance.clone(), window.clone()).unwrap();
+
     let device_extensions = DeviceExtensions {
-        // TODO get swapchain working.
-        // khr_swapchain: true,
+        khr_swapchain: true,
         ..DeviceExtensions::empty()
     };
 
@@ -91,13 +101,45 @@ fn main() {
 
     let queue = queues.next().unwrap();
 
-    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let (mut swapchain, images) = {
+        let surface_capabilities = device
+            .physical_device()
+            .surface_capabilities(&surface, Default::default())
+            .unwrap();
 
+        let image_format = device
+            .physical_device()
+            .surface_formats(&surface, Default::default())
+            .unwrap()[0]
+            .0;
+
+        Swapchain::new(
+            device.clone(),
+            surface,
+            SwapchainCreateInfo {
+                // Some drivers report an `min_image_count` of 1, but fullscreen mode requires at
+                // least 2. Therefore we must ensure the count is at least 2, otherwise the program
+                // would crash when entering fullscreen mode on those drivers.
+                min_image_count: surface_capabilities.min_image_count.max(2),
+                image_format,
+                image_extent: window.inner_size().into(),
+                image_usage: ImageUsage::COLOR_ATTACHMENT,
+                composite_alpha: surface_capabilities
+                    .supported_composite_alpha
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
     // Any struct deriving from AnyBitPattern from bytemuck library
     // can be put in a buffer. Vulkano provides its own BufferContents macro
     // that does this.
-    #[derive(BufferContents, Vertex, Debug)]
+    #[derive(BufferContents, Vertex, Debug, PartialEq)]
     // Any data sent through an FFI boundary should use repr(C).
     // Makes order, size and allignment of values match that of C/C++.
     #[repr(C)]
@@ -117,15 +159,10 @@ fn main() {
             position: [0.25, -0.1],
         },
     ];
-    let destination_vertices: [Vertex; 3] = [
-        Vertex { position: [0.0, 0.0] },
-        Vertex { position: [0.0, 0.0] },
-        Vertex { position: [0.0, 0.0] },
-    ];
-    let vertex_buffer_source = Buffer::from_iter(
+    let data_buffer = Buffer::from_iter(
         memory_allocator.clone(),
         BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
+            usage: BufferUsage::VERTEX_BUFFER,
             ..Default::default()
         },
         AllocationCreateInfo {
@@ -136,57 +173,42 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
+        // vertices,
         vertices,
     )
     .expect("Failed to create buffer!");
 
-    let vertex_buffer_destination = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                // We are using Buffer::from_data to upload data to the buffer so require
-                // that the host can accesss the buffer to upload it. Else we will need
-                // to use a proxy buffer that the data is copied from.
-                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-            ..Default::default()
-        },
-        destination_vertices,
-    )
-    .expect("Failed to create buffer!");
+    mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            src: r"
+                #version 450
 
-    let command_buffer_allocator = StandardCommandBufferAllocator::new(
-        device.clone(),
-        StandardCommandBufferAllocatorCreateInfo::default(),
-    );
+                layout(location = 0) in vec2 position;
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        &command_buffer_allocator,
-        queue_family_index,
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
+                void main() {
+                    gl_Position = vec4(position, 0.0, 1.0);
+                }
+            "
+        }
+    }
 
-    builder
-        .copy_buffer(CopyBufferInfo::buffers(
-            vertex_buffer_source.clone(),
-            vertex_buffer_destination.clone(),
-        ))
-        .unwrap();
+    mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            src: r"
+                #version 450
 
-    let command_buffer = builder.build().unwrap();
+                layout(location = 0) out vec4 f_color;
 
-    sync::now(device.clone())
-        .then_execute(queue.clone(), command_buffer)
-        .unwrap()
-        .flush()
-        .unwrap();
-
-    let src_result = vertex_buffer_source.read().unwrap();
-    println!("{:?}", src_result.iter());
-    let dst_result = vertex_buffer_destination.read().unwrap();
-    println!("{:?}", dst_result.iter());
+                void main() {
+                    f_color = vec4(1.0, 0.0, 0.0, 1.0);
+                }
+            "
+        }
+    }
+    // let command_buffer_allocator = StandardCommandBufferAllocator::new(
+    //     device.clone(),
+    //     StandardCommandBufferAllocatorCreateInfo::default(),
+    // );
 }
